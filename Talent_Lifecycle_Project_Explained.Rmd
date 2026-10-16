@@ -1,0 +1,832 @@
+---
+title: "Talent Lifecycle Analytics: Candidate Stability and Employee Attrition Risk using R"
+subtitle: "How the project works, what the datasets contain, and every output explained"
+author: "[Your name] | [Your roll no.] | 22ADC54N Introduction to Data Science Lab"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# This file DOCUMENTS the notebook. Code chunks are shown but not executed (eval = FALSE),
+# and the outputs are the ones produced by the Colab run. It therefore knits in seconds
+# and needs no packages, internet connection or data files.
+# Keep the "figures" folder next to this .Rmd file so the images load.
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = FALSE, message = FALSE)
+```
+
+# How to read this document
+
+This document explains the Colab notebook **Talent Lifecycle Analytics** from start to finish. For every step it gives three things: **what the code does**, **why it is done**, and **the output we got**, shown exactly as it appeared in the run. Code chunks are for illustration, and outputs appear as plain text blocks and figures.
+
+# Project overview
+
+## What the project does
+
+Organisations lose money in two places: when a candidate they invested in does not stay, and when an established employee leaves. The project looks at both with the same set of techniques, using R in Google Colab.
+
+| Part | Question | Data | Outcome |
+| --- | --- | --- | --- |
+| A. Candidate module | Which candidate profiles are less likely to be looking for a job change? | Kaggle job-change data, 19,158 candidates | `Likely_Join` (a stability proxy, see below) |
+| B. Retention module | Which employees are likely to leave, and why? | IBM HR attrition data, 1,470 employees | `Attrition` (Yes/No) |
+| C. Lifecycle view | How do the two compare across experience bands? | Both | Rates by experience band |
+
+Each part follows the same sequence: **load, clean, chart, split, logistic regression, LIME, association rules**. Part A adds a candidate shortlist and Part C compares the two parts.
+
+## Lab programs covered
+
+| Lab program | Where it appears |
+| --- | --- |
+| 4. Preprocessing | Sections on data preparation (missing values, code conversion, bands) |
+| 5. Visualisation with dplyr and tidyr | All charts, the tier summary (`pivot_longer`) |
+| 6. LIME | Candidate and employee explanations |
+| 7. Logistic regression | Candidate and attrition models |
+| 8. Association rules | Three rule sets (join, not join, attrition) |
+
+## An important note on interpretation
+
+The candidate dataset records whether a person **is looking for a job change**. It does not record offer acceptance, and it does not record whether anyone joined a particular company. The notebook keeps the variable name `Likely_Join` for continuity, but it is only a **proxy**:
+
+| Original `target` | `Likely_Join` | Plain meaning |
+| --- | --- | --- |
+| 0 | **Yes** | Not currently seeking a job change (a "stability proxy") |
+| 1 | No | Looking for a job change |
+
+Candidate results therefore describe **patterns associated with this proxy**, not a verified probability of joining. The IBM attrition data, in contrast, does record whether the employee left.
+
+# Environment and packages
+
+The notebook runs on a Colab R runtime. The first cell installs and loads six packages and fixes the random seed to 42 so the train/test split and results repeat every time.
+
+| Package | What it is used for |
+| --- | --- |
+| tidyverse (dplyr, tidyr, ggplot2, ...) | Data preparation, summaries, all charts |
+| caret | Train/test split and the cross-validated model that LIME needs |
+| lime | Explains individual predictions |
+| arules | Association rules (Apriori algorithm) |
+| scales | Percentage labels on charts |
+| corrplot | Correlation heat-map |
+
+**Output of the setup cell (summary):** `caret`, `lime`, `arules` and `corrplot` were installed (with dependencies such as `recipes`, `glmnet` and `e1071`). The tidyverse loaded as version 2.0.0 (dplyr 1.2.1, ggplot2 4.0.3, tidyr 1.3.2, readr 2.2.0, purrr 1.2.2), `corrplot 0.95` loaded, and the cell ended with:
+
+```
+Setup completed successfully.
+```
+
+The messages such as `dplyr::filter() masks stats::filter()` are normal. They only say that two packages use the same function name, and the code calls the intended versions.
+
+# The datasets
+
+## Dataset A: candidate profiles
+
+| Item | Detail |
+| --- | --- |
+| Name | HR Analytics: Job Change of Data Scientists |
+| Source | Kaggle, CC0 licence (file `aug_train.csv`) |
+| Size | 19,158 rows and 14 columns |
+| Unit of observation | One person who signed up for a company's data-science training |
+| Original target | `target`: 1 means looking for a job change, 0 means not looking |
+| Not used | `aug_test.csv` and `sample_submission.csv`, because the test file has no known outcomes |
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| enrollee_id | integer | Unique candidate ID |
+| city | text | City code (not used in the model) |
+| city_development_index | number | Development index of the city (about 0.45 to 0.95) |
+| gender | text | Male, Female, Other, or blank |
+| relevent_experience | text | Has / No relevant experience (spelling as in the source) |
+| enrolled_university | text | no_enrollment, Full time course, Part time course |
+| education_level | text | Primary School, High School, Graduate, Masters, Phd |
+| major_discipline | text | STEM, Business Degree, Arts, Humanities, No Major, Other |
+| experience | text | Years of experience, with codes "<1" and ">20" |
+| company_size | text | Size band of the current employer |
+| company_type | text | Type of the current employer |
+| last_new_job | text | Years since the last job change, with codes "never" and ">4" |
+| training_hours | integer | Training hours completed |
+| target | number | 1 = looking for a job change, 0 = not |
+
+## Dataset B: employee records
+
+| Item | Detail |
+| --- | --- |
+| Name | IBM HR Analytics Employee Attrition and Performance |
+| Source | IBM public dataset, loaded from a GitHub copy (with an upload fallback) |
+| Size | 1,470 rows and 35 columns |
+| Outcome | `Attrition`: Yes if the employee left |
+| Provenance | Described as fictional, created by IBM data scientists. It is a public benchmark, not real company records |
+| Variables used by the model | Age, MonthlyIncome, OverTime, JobSatisfaction, DistanceFromHome, YearsAtCompany, WorkLifeBalance, TotalWorkingYears, JobLevel, NumCompaniesWorked, EnvironmentSatisfaction |
+
+# Part A: candidate module
+
+## Loading the data
+
+**What the code does:** the function `load_candidates()` looks for `aug_train.csv` in the Colab Files panel and reads it, treating empty strings as missing values. If the file is not there, it falls back to the same data in the CRAN package `dlookr`. The code then checks that all required columns exist and stops with a clear message if not.
+
+**Output:**
+
+```
+Using local aug_train.csv
+Rows: 19158 | Columns: 14
+```
+
+followed by `glimpse(cand_raw)`, which lists the 14 columns. For example `enrollee_id` is `<int>`, `city_development_index` is `<dbl>` (0.920, 0.776, 0.624, ...), and `gender`, `education_level`, `experience`, `company_size` and `last_new_job` are `<chr>`, with `NA` where the value is blank.
+
+## Helper functions
+
+Before cleaning, one cell defines helper functions so later cells stay short.
+
+| Helper | What it does |
+| --- | --- |
+| `make_exp_band` | Groups years of experience into 0-2, 3-5, 6-10, 11-15 and 16+, used for both datasets |
+| `rate_bar` | Bar chart of the "Yes" rate for each category, labelled with percentage and count |
+| `auc_fn` | Computes AUC (area under the ROC curve) from probabilities |
+| `youden_threshold` | Finds the probability cut-off that best balances catching true cases and avoiding false alarms |
+| `roc_points` | Calculates points of the ROC curve |
+| `eval_model` | Builds the confusion matrix and reports accuracy, recall, specificity, precision and AUC |
+| `mine_rules` | Runs Apriori with a fixed outcome, at most 4 items per rule, redundant rules removed, sorted by lift |
+| `show_rules` | Prints and charts the top 10 rules and saves them to a CSV |
+| `drop_unknown` | Removes rules that rely on a missing-value ("Unknown") category |
+
+**Output:** `All helper functions are defined successfully.`
+
+## Data preparation
+
+### Missing values
+
+**What the code does:** counts blanks per column, prints a table, and draws a bar chart of the percentage missing.
+
+**Output:**
+
+```
+              column n_missing pct_missing
+1       company_type      6140        32.0
+2       company_size      5938        31.0
+3             gender      4508        23.5
+4   major_discipline      2813        14.7
+5    education_level       460         2.4
+6       last_new_job       423         2.2
+7 enrolled_university       386         2.0
+8         experience        65         0.3
+9 ... (6 other columns)        0         0.0
+```
+
+![Figure 1. Share of missing values by column in the candidate data.](figures/a01_missing.png){width=80%}
+
+**Reading it:** company type and company size are blank for about a third of candidates, and gender for nearly a quarter. This is why the missing-value handling below matters.
+
+### Duplicates
+
+```
+Duplicate enrollee IDs: 0
+Rows sharing an identical profile with another row: 49
+```
+
+Every ID is unique. Forty-nine rows share an identical profile with another row. They are **kept**, because different people can have the same profile.
+
+### Cleaning and feature engineering
+
+| Step | What it does | Why |
+| --- | --- | --- |
+| Convert `experience` | "<1" becomes 0, ">20" becomes 21, others become numbers (`experience_yrs`) | Models need numbers |
+| Convert `last_new_job` | "never" becomes 0, ">4" becomes 5 (`last_new_job_yrs`) | Same reason |
+| Median fill | Missing numeric values (experience, last job change, city index) take the median | Only a handful are missing |
+| "Unknown" category | Blank gender, university, education, major, company size and type become `Unknown` | Avoids deleting about a third of the rows, and blanks can carry information |
+| Create target | `Likely_Join` = Yes when `target` is 0, otherwise No | The stability proxy |
+| Experience band | `exp_band` from `experience_yrs` | Used in charts, rules and the lifecycle comparison |
+| Factor levels | Education and company size are put in a sensible order | Cleaner tables and charts |
+| Modelling table | 11 predictors plus the outcome, text columns as factors | Input to the model |
+
+**Output of the modelling table (`glimpse(cand_model)`):**
+
+```
+Rows: 19,158
+Columns: 12
+$ city_development_index <dbl> 0.920, 0.776, 0.624, 0.789, 0.767, ...
+$ gender                 <fct> Male, Male, Unknown, Unknown, Male, ...
+$ relevant_exp           <fct> Relevant_Exp, No_Relevant_Exp, ...
+$ enrolled_university    <fct> no_enrollment, no_enrollment, Full time course, ...
+$ education_level        <fct> Graduate, Graduate, Graduate, Graduate, Masters ...
+$ major_discipline       <fct> STEM, STEM, STEM, Business Degree, STEM ...
+$ experience_yrs         <dbl> 21, 15, 5, 0, 21, 11, 5, 13, 7, 17, 2, ...
+$ company_size           <fct> Unknown, 50-99, Unknown, Unknown, 50-99, ...
+$ company_type           <fct> Unknown, Pvt Ltd, Unknown, Pvt Ltd, Funded Startup ...
+$ last_new_job_yrs       <dbl> 1, 5, 0, 0, 4, 1, 1, 5, 1, 5, 0, 1, 3, ...
+$ training_hours         <int> 36, 47, 83, 52, 8, 24, 24, 18, 46, 123, ...
+$ Likely_Join            <fct> No, Yes, Yes, No, Yes, No, Yes, No, No, Yes ...
+
+Class balance (Likely_Join):
+   No   Yes 
+0.249 0.751
+```
+
+The `glimpse` shows 12 columns: the 11 predictors and the outcome. About **75.1%** of candidates are in the "not seeking a job change" class, so the data is imbalanced, which matters for the model.
+
+## Exploratory analysis and charts
+
+### Overall split
+
+![Figure 2. Candidates not seeking a job change (Yes, 75.1%) versus seeking (No, 24.9%).](figures/a02_overall_split.png){width=75%}
+
+### Rate by education level
+
+![Figure 3. Stability-proxy rate by education level.](figures/a03_education.png){width=85%}
+
+| Education | Rate | Candidates |
+| --- | --- | --- |
+| Primary School | 86.7% | 308 |
+| Phd | 86.0% | 414 |
+| High School | 80.5% | 2,017 |
+| Masters | 78.6% | 4,361 |
+| Unknown | 77.4% | 460 |
+| Graduate | 72.0% | 11,598 |
+
+Graduates are the largest group and have the lowest rate.
+
+### Rate by experience band
+
+![Figure 4. Stability-proxy rate by experience band.](figures/a04_experience.png){width=85%}
+
+| Experience | Rate | Candidates |
+| --- | --- | --- |
+| 16+ | 84.4% | 4,868 |
+| 11-15 | 80.9% | 2,829 |
+| 6-10 | 74.7% | 5,076 |
+| 3-5 | 67.8% | 4,187 |
+| 0-2 | 61.6% | 2,198 |
+
+The rate rises steadily with experience, from 61.6% to 84.4%.
+
+### Relevant experience and university enrolment
+
+![Figure 5. Rate by relevant experience.](figures/a05_relevant_exp.png){width=75%}
+
+![Figure 6. Rate by university enrolment.](figures/a06_university.png){width=75%}
+
+| Group | Rate | Candidates |
+| --- | --- | --- |
+| Relevant experience | 78.5% | 13,792 |
+| No relevant experience | 66.2% | 5,366 |
+| No university enrolment | 78.9% | 13,817 |
+| Part-time course | 74.8% | 1,198 |
+| Unknown | 68.1% | 386 |
+| Full-time course | 61.9% | 3,757 |
+
+Candidates with relevant experience, and those not studying full-time, are more often in the stability class.
+
+### City development index and training hours
+
+![Figure 7. City development index by outcome.](figures/a07_city_dev.png){width=75%}
+
+![Figure 8. Training hours by outcome.](figures/a08_training_hours.png){width=75%}
+
+**Reading them:** candidates in the stability class are concentrated at a city development index of about 0.92, while many of the others come from cities near 0.62. Training hours look almost the same for both groups, so training effort is not a strong separator.
+
+### Education by experience heat-map
+
+![Figure 9. Stability-proxy rate by education and experience (groups with at least 30 candidates).](figures/a09_heatmap.png){width=85%}
+
+| Education | 0-2 | 3-5 | 6-10 | 11-15 | 16+ |
+| --- | --- | --- | --- | --- | --- |
+| Phd | | | 85% | 87% | 87% |
+| Masters | 63% | 66% | 77% | 84% | 85% |
+| Graduate | 53% | 64% | 72% | 79% | 83% |
+| High School | 75% | 79% | 82% | 84% | 91% |
+| Primary School | 80% | 89% | 94% | | |
+
+The lowest rate is 53% (graduates with 0-2 years of experience) and the highest is 94% (primary school, 6-10 years). Blank cells are groups with fewer than 30 candidates.
+
+## Logistic regression model
+
+### Why logistic regression
+
+The outcome has two classes, and the coefficients convert into odds ratios that are easy to explain. Results describe **associations, not causes**.
+
+### Train/test split and model
+
+```{r}
+train_idx_c <- as.vector(createDataPartition(cand_model$Likely_Join, p = 0.75, list = FALSE))
+train_c <- cand_model[train_idx_c, ]
+test_c  <- cand_model[-train_idx_c, ]
+log_c <- glm(Likely_Join ~ ., data = train_c, family = binomial)
+```
+
+`createDataPartition` splits the data 75% for training and 25% for testing while keeping the Yes/No ratio the same in both. `glm(..., family = binomial)` fits the logistic regression using every other column as a predictor. The model never sees the test data while learning.
+
+**Output:**
+
+```
+Train: 14369 | Test: 4789
+```
+
+### Model summary
+
+```
+Coefficients:                                   Estimate Std.Error z value Pr(>|z|)
+(Intercept)                                     -4.2446   0.7089   -5.988  2.13e-09 ***
+city_development_index                           5.8239   0.1791   32.522  < 2e-16  ***
+genderMale                                       0.2641   0.0876    3.013  0.0026   **
+genderOther                                      0.1381   0.2372    0.582  0.5605
+genderUnknown                                    0.1558   0.0937    1.663  0.0963   .
+relevant_expRelevant_Exp                         0.0890   0.0574    1.550  0.1211
+enrolled_universityno_enrollment                 0.2068   0.0584    3.542  0.0004   ***
+enrolled_universityPart time course              0.1637   0.0970    1.688  0.0914   .
+enrolled_universityUnknown                       0.1831   0.1476    1.241  0.2148
+education_levelPrimary School                    0.4491   0.2504    1.793  0.0730   .
+education_levelHigh School                       0.1135   0.1628    0.697  0.4858
+education_levelGraduate                         -1.0904   0.6448   -1.691  0.0908   .
+education_levelMasters                          -0.9228   0.6468   -1.427  0.1536
+education_levelPhd                              -0.6847   0.6710   -1.020  0.3075
+major_disciplineBusiness Degree                 -0.0297   0.2467   -0.120  0.9043
+major_disciplineHumanities                       0.0927   0.2240    0.414  0.6789
+major_disciplineNo Major                         0.3017   0.2809    1.074  0.2829
+major_disciplineOther                            0.2351   0.2427    0.969  0.3326
+major_disciplineSTEM                             0.1592   0.1924    0.827  0.4082
+major_disciplineUnknown                          0.0881   0.6563    0.134  0.8932
+experience_yrs                                   0.0279   0.0043    6.457  1.07e-10 ***
+company_size<10                                  1.2310   0.1239    9.932  < 2e-16  ***
+company_size10/49                                0.9506   0.1130    8.413  < 2e-16  ***
+company_size50-99                                1.1644   0.0982   11.853  < 2e-16  ***
+company_size100-500                              1.1930   0.1030   11.581  < 2e-16  ***
+company_size500-999                              1.1190   0.1330    8.414  < 2e-16  ***
+company_size1000-4999                            1.2170   0.1236    9.848  < 2e-16  ***
+company_size5000-9999                            1.0021   0.1568    6.390  1.66e-10 ***
+company_size10000+                               0.9092   0.1064    8.543  < 2e-16  ***
+company_typeFunded Startup                       0.3876   0.1723    2.250  0.0244   *
+company_typeNGO                                  0.0501   0.1923    0.261  0.7943
+company_typeOther                               -0.3272   0.2992   -1.093  0.2743
+company_typePublic Sector                       -0.0921   0.1672   -0.551  0.5815
+company_typePvt Ltd                              0.1993   0.1349    1.478  0.1394
+company_typeUnknown                             -0.1313   0.1522   -0.862  0.3885
+last_new_job_yrs                                -0.0632   0.0158   -4.006  6.18e-05 ***
+training_hours                                   0.0009   0.0004    2.426  0.0153   *
+
+Null deviance: 16140 on 14368 degrees of freedom
+Residual deviance: 13309 on 14332 degrees of freedom
+AIC: 13383      Number of Fisher Scoring iterations: 4
+```
+
+The stars show significance. A positive estimate raises the odds of being in the stability class, and a negative estimate lowers them. The residual deviance is lower than the null deviance, so the predictors add information.
+
+### Odds ratios
+
+The code converts each coefficient to an **odds ratio** with `exp()` and keeps only significant ones (p below 0.05). An odds ratio above 1 raises the odds, and below 1 lowers them. Each ratio is relative to the variable's reference group (for example, Unknown company size, Female gender, full-time study).
+
+```
+   term                              odds_ratio   p_value
+1  city_development_index              338.290    5.2e-232
+2  company_size<10                       3.425    3.0e-23
+3  company_size1000-4999                 3.377    7.0e-23
+4  company_size100-500                   3.297    5.1e-31
+5  company_size50-99                     3.204    2.1e-32
+6  company_size500-999                   3.062    4.0e-17
+7  company_size5000-9999                 2.724    1.7e-10
+8  company_size10/49                     2.587    4.0e-17
+9  company_size10000+                    2.482    1.3e-17
+10 company_typeFunded Startup            1.473    0.024
+11 genderMale                            1.302    0.0026
+12 enrolled_universityno_enrollment      1.230    0.0004
+13 experience_yrs                        1.028    1.1e-10
+14 training_hours                        1.001    0.015
+15 last_new_job_yrs                      0.939    6.2e-05
+```
+
+![Figure 10. Significant odds ratios (log scale).](figures/a10_odds_ratios.png){width=85%}
+
+**Reading it:**
+
+- **City development index** is by far the strongest. Its ratio (338) is huge because the index only spans about 0.45 to 0.95, so a one-unit change is never actually observed.
+- Candidates whose company size is **known** have roughly **2.5 to 3.4 times** the odds of those with an unknown size.
+- Funded start-ups, male candidates and candidates not enrolled in a course have modestly higher odds.
+- More years of experience slightly raises the odds. A longer gap since the last job change (`last_new_job_yrs`) slightly lowers them.
+
+### Choosing the cut-off (threshold)
+
+About 75% of candidates are in the Yes class, so the default cut-off of 0.5 labels almost everyone Yes. The code therefore tunes the cut-off on the **training** data with **Youden's J**, which picks the value that best balances true positives and false alarms. The test data is used only for scoring.
+
+```{r}
+prob_train_c <- predict(log_c, newdata = train_c, type = "response")
+thr_c <- youden_threshold(prob_train_c, train_c$Likely_Join)
+test_c$prob <- predict(log_c, newdata = test_c, type = "response")
+```
+
+### Evaluation on the test set
+
+**Confusion matrix at the tuned cut-off (0.76):**
+
+```
+         Actual
+Predicted   No  Yes
+      No   888 1004
+      Yes  306 2591
+```
+
+**Metrics:**
+
+| Cut-off | Accuracy | Recall | Specificity | Precision | AUC |
+| --- | --- | --- | --- | --- | --- |
+| 0.50 | 0.767 | 0.932 | 0.271 | 0.794 | 0.770 |
+| **0.76 (tuned)** | 0.726 | 0.721 | 0.744 | 0.894 | 0.770 |
+
+![Figure 11. ROC curve of the candidate model (red dot = tuned cut-off 0.76).](figures/a11_roc_hiring.png){width=60%}
+
+**Reading it:**
+
+- **Recall** is the share of real "Yes" candidates the model finds. **Specificity** is the share of real "No" candidates it correctly leaves out.
+- At 0.5 the model finds 93.2% of Yes candidates but correctly identifies only 27.1% of the others, because it labels nearly everyone Yes.
+- At 0.76 the two are balanced (72.1% and 74.4%) and precision is 89.4%.
+- **AUC = 0.77** means a randomly chosen Yes candidate gets a higher score than a randomly chosen No candidate about 77% of the time. It does not change with the cut-off.
+
+## LIME: why was a candidate ranked high or low?
+
+**What the code does:** LIME explains one prediction at a time. The same model is refitted through `caret` with 5-fold cross-validation (LIME works best with caret models). The code picks the **3 highest** and **3 lowest** predicted candidates in the test set and asks LIME for the **6 most influential features** for each.
+
+```{r}
+explanation_c <- lime::explain(lime_cases_c, explainer_c, labels = "Yes", n_features = 6)
+```
+
+**Output:** a grid of six panels, saved as `hiring_lime_explanations.png`. Each panel shows the case number, the predicted probability, the **explanation fit**, and a bar per feature. Blue bars **support** the Yes class and red bars **contradict** it. The bar length is the feature's weight.
+
+![Figure 12. LIME explanations for the three highest and three lowest ranked test candidates.](figures/a12_lime_hiring.png){width=100%}
+
+| Case | Probability | Fit | Main features |
+| --- | --- | --- | --- |
+| 11010, 10414, 17300 | 0.98 | 0.15 | Supported by high school education, city index above 0.92, company size 1000-4999 or under 10, more than 16 years of experience, private limited company, last job change within 1 year |
+| 808, 591, 11379 | 0.10 to 0.13 | 0.76 to 0.78 | Pulled down by city index of 0.739 or less, unknown company size, graduate education, and (in some cases) full-time study or 4 years or less of experience |
+
+**Reading it:** explanation fit says how well LIME's local approximation matches the model for that person. The low scorers (fit 0.76 to 0.78) are explained well. The high scorers (fit 0.15) are explained **weakly**, so treat those explanations as rough.
+
+## Association rules: which profile combinations go with the outcome?
+
+**What the code does:**
+
+1. Continuous fields are grouped into bands (city development into low, mid and high, training hours into three equal groups, last job gap into four groups).
+2. Every candidate becomes a "basket" of items such as `Education=Graduate`.
+3. The **Apriori** algorithm finds rules that end in a fixed outcome.
+
+| Term | Meaning |
+| --- | --- |
+| Support | Share of all candidates matching the rule |
+| Confidence | Among those matching the left-hand side, the share who also have the outcome |
+| Lift | Confidence divided by the overall rate of the outcome. Above 1 means more common than chance |
+
+```{r}
+rules_join    <- mine_rules(trans_c, "Likely_Join=Yes", supp = 0.03, conf = 0.90)
+rules_notjoin <- mine_rules(trans_c, "Likely_Join=No",  supp = 0.02, conf = 0.45)
+```
+
+Rules have at most 4 items and redundant rules are removed. The cell prints each list twice: once with all rules, and once **excluding** rules that use `Unknown` values.
+
+### Profiles linked to NOT seeking a job change (outcome Yes)
+
+| Rule (left-hand side) | Support | Confidence | Lift |
+| --- | --- | --- | --- |
+| Major=Unknown, LastJobGap=Never_Changed, CityDev=HighDev | 0.0322 | 0.938 | 1.249 |
+| Major=STEM, CompanySize=<10, CityDev=HighDev | 0.0317 | 0.935 | 1.246 |
+| Relevance=Relevant_Exp, CompanySize=<10, CityDev=HighDev | 0.0371 | 0.934 | 1.245 |
+| Relevance=Relevant_Exp, CompanyType=Funded Startup, CityDev=HighDev | 0.0338 | 0.934 | 1.244 |
+| University=no_enrollment, CompanyType=Funded Startup, CityDev=HighDev | 0.0322 | 0.933 | 1.243 |
+| CompanyType=Funded Startup, CityDev=HighDev | 0.0369 | 0.930 | 1.239 |
+| University=no_enrollment, CompanySize=50-99, CityDev=HighDev | 0.0889 | 0.930 | 1.238 |
+| University=no_enrollment, CompanySize=<10, CityDev=HighDev | 0.0343 | 0.929 | 1.238 |
+| Education=Masters, CompanyType=Pvt Ltd, CityDev=HighDev | 0.0872 | 0.927 | 1.235 |
+| CompanySize=<10, CityDev=HighDev | 0.0432 | 0.927 | 1.235 |
+
+![Figure 13. Top rules for the stability class (lift).](figures/a13_rules_join.png){width=100%}
+
+**Reading it:** every top rule contains a **high-development city**. Lifts are near 1.24, which is close to the maximum possible (about 1.33), because 75% of candidates are in this class anyway. The known-values-only version drops the first rule and adds `ExpBand=16+, CompanyType=Pvt Ltd, CityDev=HighDev` (support 0.121, confidence 0.926, lift 1.234).
+
+### Profiles linked to seeking a job change (outcome No)
+
+| Rule (left-hand side) | Support | Confidence | Lift |
+| --- | --- | --- | --- |
+| Education=Graduate, CompanySize=Unknown, CityDev=MidDev | 0.0291 | 0.582 | 2.336 |
+| CityDev=LowDev | 0.0219 | 0.579 | 2.323 |
+| Major=STEM, CompanySize=Unknown, CityDev=MidDev | 0.0341 | 0.573 | 2.297 |
+| Education=Graduate, CompanyType=Unknown, CityDev=MidDev | 0.0298 | 0.569 | 2.284 |
+| CompanySize=Unknown, LastJobGap=1yr, CityDev=MidDev | 0.0205 | 0.566 | 2.269 |
+| Education=Graduate, No_Relevant_Exp, CityDev=MidDev | 0.0247 | 0.561 | 2.250 |
+| Education=Graduate, No_Relevant_Exp, CompanySize=Unknown | 0.0457 | 0.559 | 2.244 |
+| Major=STEM, CompanyType=Unknown, CityDev=MidDev | 0.0352 | 0.556 | 2.230 |
+| Education=Graduate, No_Relevant_Exp, CompanyType=Unknown | 0.0440 | 0.555 | 2.226 |
+| University=Full time course, CompanyType=Unknown, CityDev=MidDev | 0.0219 | 0.551 | 2.210 |
+
+![Figure 14. Top rules for the seeking-a-change class (lift).](figures/a14_rules_notjoin.png){width=100%}
+
+**Known-values-only version (top rules):** `CityDev=LowDev` (lift 2.32), `Graduate + No_Relevant_Exp + MidDev` (2.25), `No_Relevant_Exp + STEM + MidDev` (2.15), `No_Relevant_Exp + Full time course + MidDev` (2.09), and `ExpBand=0-2 + MidDev` (confidence 0.521, lift 2.09).
+
+**Reading it:** the strongest rules for the seeking-a-change class have a lift above 2.2: **graduates in mid- or low-development cities without relevant experience**, and early-career candidates (0-2 years). `Unknown` in a rule means the field was blank, not that the employer is "unknown", so the known-values-only list is better for presentation.
+
+## Candidate shortlist: ranking by the stability proxy
+
+**What the code does:** test candidates are sorted by predicted probability and split into **five equal tiers** with `ntile(desc(prob_join), 5)`. Tier 1 is the top 20%. The code then compares the average predicted probability with the actual rate in each tier, and saves the top 15 to `top_candidates_shortlist.csv`.
+
+**Output (`tier_summary`):**
+
+| Tier | Candidates | Average predicted | Actual rate |
+| --- | --- | --- | --- |
+| 1 | 958 | 0.935 | 0.914 |
+| 2 | 958 | 0.896 | 0.914 |
+| 3 | 958 | 0.833 | 0.857 |
+| 4 | 958 | 0.673 | 0.618 |
+| 5 | 957 | 0.432 | 0.449 |
+
+![Figure 15. Predicted versus actual rate by tier (Tier 1 = highest predicted).](figures/a15_tiers.png){width=90%}
+
+**Reading it:**
+
+- The actual rate falls from **91.4%** (Tiers 1 and 2) to **44.9%** (Tier 5), so the ranking separates high-stability candidates from the rest.
+- Predicted and actual rates track each other closely (for example Tier 5: 43.2% against 44.9%), which means the model is well calibrated.
+- Tiers 1 and 2 have the **same** actual rate, so the model separates the top 40% from the bottom clearly but not Tier 1 from Tier 2.
+
+**Top 15 candidates (all in Tier 1, all with actual outcome Yes):**
+
+| # | enrollee_id | Education | Experience (yrs) | Relevant exp. | Company type | Last job (yrs) | Training hrs | Probability |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 29677 | High School | 18 | Yes | Pvt Ltd | 1 | 196 | 0.982 |
+| 2 | 21521 | High School | 21 | Yes | Pvt Ltd | 0 | 59 | 0.981 |
+| 3 | 14465 | High School | 21 | Yes | Pvt Ltd | 0 | 12 | 0.981 |
+| 4 | 25335 | Primary School | 21 | Yes | Pvt Ltd | 1 | 102 | 0.981 |
+| 5 | 28963 | High School | 21 | Yes | Pvt Ltd | 2 | 216 | 0.980 |
+| 6 | 10768 | High School | 21 | Yes | Pvt Ltd | 1 | 44 | 0.980 |
+| 7 | 114 | Unknown | 21 | Yes | Funded Startup | 1 | 82 | 0.979 |
+| 8 | 3552 | High School | 16 | Yes | Pvt Ltd | 0 | 66 | 0.979 |
+| 9 | 24762 | Primary School | 5 | Yes | Pvt Ltd | 0 | 31 | 0.978 |
+| 10 | 14054 | Unknown | 21 | No | Pvt Ltd | 0 | 60 | 0.978 |
+| 11 | 22291 | Unknown | 21 | Yes | Pvt Ltd | 1 | 15 | 0.978 |
+| 12 | 21255 | High School | 21 | Yes | Pvt Ltd | 2 | 26 | 0.977 |
+| 13 | 248 | Primary School | 10 | Yes | Pvt Ltd | 0 | 9 | 0.976 |
+| 14 | 15795 | High School | 14 | Yes | Pvt Ltd | 1 | 38 | 0.976 |
+| 15 | 10295 | High School | 21 | Yes | Pvt Ltd | 3 | 46 | 0.976 |
+
+**Reading it, with a caution:** the top of the list is dominated by candidates with a blank major discipline, primary or high school education, long experience and a private limited employer. That is what the *proxy* rewards: people who are **unlikely to be looking for a new job**. It does not mean they are the best hires, and this is why the list should be used to demonstrate ranking, not as an automated hiring decision.
+
+# Part B: retention module
+
+## Loading the employee data
+
+**What the code does:** reads the IBM file from a GitHub link (with an upload fallback and a fix for a hidden character in the first column name), then checks the expected columns exist.
+
+```
+Rows: 1470 | Columns: 35
+Missing values: 0 | Duplicate rows: 0
+```
+
+## Data preparation
+
+Constant columns carry no information and are dropped, along with the employee number. Text columns become factors, `Attrition` is set to No/Yes, and total working years are grouped into the same five experience bands used for candidates.
+
+```
+Constant columns dropped: EmployeeCount Over18 StandardHours
+
+Attrition class balance:
+   No   Yes 
+0.839 0.161
+```
+
+Only **16.1%** of employees left, so this outcome is also imbalanced.
+
+## Exploratory analysis and charts
+
+![Figure 16. Attrition rate by job role.](figures/b01_attr_role.png){width=85%}
+
+![Figure 17. Attrition rate by total work experience.](figures/b02_attr_experience.png){width=85%}
+
+![Figure 18. Attrition rate: overtime versus no overtime.](figures/b03_attr_overtime.png){width=85%}
+
+| Job role | Attrition | Employees |
+| --- | --- | --- |
+| Sales Representative | 39.8% | 83 |
+| Laboratory Technician | 23.9% | 259 |
+| Human Resources | 23.1% | 52 |
+| Sales Executive | 17.5% | 326 |
+| Research Scientist | 16.1% | 292 |
+| Manufacturing Director | 6.9% | 145 |
+| Healthcare Representative | 6.9% | 131 |
+| Manager | 4.9% | 102 |
+| Research Director | 2.5% | 80 |
+
+| Experience | Attrition | Employees |
+| --- | --- | --- |
+| 0-2 years | 43.9% | 123 |
+| 3-5 years | 19.2% | 193 |
+| 6-10 years | 15.0% | 607 |
+| 11-15 years | 12.6% | 191 |
+| 16+ years | 8.7% | 356 |
+
+| Overtime | Attrition | Employees |
+| --- | --- | --- |
+| Yes | 30.5% | 416 |
+| No | 10.4% | 1,054 |
+
+![Figure 19. Monthly income by attrition status.](figures/b04_income.png){width=75%}
+
+![Figure 20. Attrition by job satisfaction (1 = low, 4 = very high).](figures/b05_satisfaction.png){width=75%}
+
+![Figure 21. Correlation heat-map of the numeric variables.](figures/b06_correlation.png){width=75%}
+
+**Reading them:**
+
+- Attrition is highest for **sales representatives (39.8%)**, laboratory technicians and HR staff, and lowest for research directors and managers.
+- It is **43.9%** in the first two years of experience and falls to **8.7%** at 16+ years.
+- Employees working **overtime** leave at 30.5%, about three times the rate of those who do not (10.4%).
+- Leavers had **lower monthly incomes**, and attrition falls as job satisfaction rises (about 23% at level 1 to about 11% at level 4).
+- The correlation heat-map shows that income, job level and total working years move together, which is worth remembering when reading the model.
+
+## Logistic regression model
+
+```
+Train: 1103 | Test: 367
+```
+
+The model uses 11 predictors (age, income, overtime, job satisfaction, distance from home, years at company, work-life balance, total working years, job level, companies worked and environment satisfaction).
+
+```
+Coefficients:
+                          Estimate  Std. Error z value Pr(>|z|)
+(Intercept)               1.797e+00  6.269e-01   2.867 0.004148 **
+Age                      -3.442e-02  1.369e-02  -2.515 0.011907 *
+MonthlyIncome            -1.024e-05  6.787e-05  -0.151 0.880064
+OverTimeYes               1.505e+00  1.884e-01   7.984 1.41e-15 ***
+JobSatisfaction          -3.555e-01  8.209e-02  -4.330 1.49e-05 ***
+DistanceFromHome          3.725e-02  1.084e-02   3.437 0.000589 ***
+YearsAtCompany            1.480e-02  2.830e-02   0.523 0.601000
+WorkLifeBalance          -2.799e-01  1.256e-01  -2.229 0.025824 *
+TotalWorkingYears        -9.197e-02  3.085e-02  -2.981 0.002871 **
+JobLevel                 -5.642e-02  2.779e-01  -0.203 0.839092
+NumCompaniesWorked        1.587e-01  3.792e-02   4.186 2.84e-05 ***
+EnvironmentSatisfaction  -3.663e-01  8.277e-02  -4.426 9.61e-06 ***
+
+Null deviance: 974.94 on 1102 degrees of freedom
+Residual deviance: 800.64 on 1091 degrees of freedom
+AIC: 824.64
+```
+
+**Reading it** (odds ratios are the exponentials of the estimates):
+
+| Predictor | Odds ratio | Meaning |
+| --- | --- | --- |
+| OverTime = Yes | 4.50 | Overtime workers have about 4.5 times the odds of leaving |
+| NumCompaniesWorked (per company) | 1.17 | More previous employers raise the odds |
+| DistanceFromHome (per unit) | 1.04 | Longer commutes raise the odds |
+| JobSatisfaction (per level) | 0.70 | Each satisfaction level lowers the odds by about 30% |
+| EnvironmentSatisfaction (per level) | 0.69 | Same direction |
+| WorkLifeBalance (per level) | 0.76 | Better balance lowers the odds |
+| TotalWorkingYears (per year) | 0.91 | More experience lowers the odds |
+| Age (per year) | 0.97 | Older employees leave less |
+
+`MonthlyIncome`, `YearsAtCompany` and `JobLevel` are **not significant** here. They are strongly related to total working years, so their effect is already captured by it.
+
+**Confusion matrix at the tuned cut-off (0.26) and metrics:**
+
+```
+         Actual
+Predicted  No Yes
+      No  274  26
+      Yes  34  33
+```
+
+| Cut-off | Accuracy | Recall | Specificity | Precision | AUC |
+| --- | --- | --- | --- | --- | --- |
+| 0.50 | 0.850 | 0.203 | 0.974 | 0.600 | 0.768 |
+| **0.26 (tuned)** | 0.837 | 0.559 | 0.890 | 0.493 | 0.768 |
+
+![Figure 22. ROC curve of the attrition model (dot = tuned cut-off 0.26).](figures/b07_roc_retention.png){width=65%}
+
+**Reading it:**
+
+- Because only about 16% leave, a model that predicted "nobody leaves" would be about 83% accurate and useless. **Accuracy alone is misleading**, so recall and AUC are reported.
+- At 0.5 the model finds only **20.3%** of leavers. At 0.26 it finds **55.9%** (33 of the 59 leavers in the test set) at the cost of a small drop in accuracy.
+- AUC is 0.768, so the ranking quality is similar to the candidate model.
+- The test set is small (367 employees, 59 leavers), so the figures can vary.
+
+## LIME: why is a specific employee flagged as high risk?
+
+LIME explains the four highest-risk employees in the test set (6 features each).
+
+![Figure 23. LIME explanations for the four highest-risk employees.](figures/b08_lime_retention.png){width=100%}
+
+| Case | Probability of leaving | Fit | Main features |
+| --- | --- | --- | --- |
+| 1314 | 0.81 | 0.54 | OverTime = Yes, TotalWorkingYears <= 6, EnvironmentSatisfaction <= 2, JobSatisfaction <= 2, Age <= 30 (supporting); 2 < WorkLifeBalance <= 3 (contradicting) |
+| 799 | 0.79 | 0.54 | OverTime = Yes, TotalWorkingYears <= 6, DistanceFromHome > 13, low satisfaction (supporting) |
+| 657 | 0.74 | 0.60 | OverTime = Yes, TotalWorkingYears <= 6, DistanceFromHome > 13 (supporting); NumCompaniesWorked <= 1 and high job and environment satisfaction (contradicting) |
+| 1138 | 0.71 | 0.60 | OverTime = Yes, TotalWorkingYears <= 6, low environment satisfaction, Age <= 30, long distance (supporting); NumCompaniesWorked <= 1 (contradicting) |
+
+**Reading it:** **overtime and six or fewer years of total experience** support leaving in all four cases, which agrees with the charts and the model. An explanation fit of 0.54 to 0.60 means the explanations are indicative, not exact.
+
+## Association rules for attrition
+
+```{r}
+rules_attr <- mine_rules(trans_e, "Attrition=Yes", supp = 0.01, conf = 0.30)
+```
+
+Support 0.01 means a rule must cover at least about 15 of the 1,470 employees. Confidence 0.30 means at least 30% of them left, compared with 16.1% overall.
+
+**Output:** `Number of attrition rules found: 104`. The top 10 by lift:
+
+| Rule (left-hand side) | Support | Confidence | Lift |
+| --- | --- | --- | --- |
+| OverTime=Yes, MaritalStatus=Single, DistanceBand=Far | 0.0102 | 0.682 | 4.23 |
+| OverTime=Yes, MaritalStatus=Single, JobSat=Med | 0.0116 | 0.680 | 4.22 |
+| OverTime=Yes, JobRole=Sales Representative | 0.0109 | 0.667 | 4.14 |
+| OverTime=Yes, MaritalStatus=Single, AgeBand=Young | 0.0245 | 0.655 | 4.06 |
+| OverTime=Yes, Department=Sales, MaritalStatus=Single | 0.0218 | 0.653 | 4.05 |
+| JobRole=Sales Representative, MaritalStatus=Single, AgeBand=Young | 0.0122 | 0.643 | 3.99 |
+| OverTime=Yes, JobRole=Laboratory Technician, AgeBand=Young | 0.0129 | 0.633 | 3.93 |
+| OverTime=Yes, JobRole=Sales Executive, MaritalStatus=Single | 0.0136 | 0.625 | 3.88 |
+| Department=Sales, MaritalStatus=Single, JobSat=Med | 0.0122 | 0.621 | 3.85 |
+| MaritalStatus=Single, AgeBand=Young, JobSat=Med | 0.0129 | 0.559 | 3.47 |
+
+![Figure 24. Top rules associated with attrition (lift).](figures/b09_rules_attrition.png){width=100%}
+
+**Reading it:** **overtime plus single marital status** appears in most of the strongest rules, often with young age, a long commute or a sales role. Their lift is about 4, so employees matching them leave at roughly four times the average rate. For example, `{OverTime=Yes, Single, Young}` has confidence 0.655 and covers about 36 employees (support 0.0245 of 1,470). These groups are small, so treat the rules as patterns to investigate, not as predictions for any individual.
+
+# Part C: lifecycle view
+
+**What the code does:** for each experience band it computes the share of candidates in the stability class and the share of employees who **stay** (1 minus attrition), then plots both on one chart. The two groups are **different people**, so this compares group-level rates only and is not a causal lifecycle prediction.
+
+| Experience band | Candidates: not seeking a change (proxy) | Employees: stay |
+| --- | --- | --- |
+| 0-2 | 0.616 | 0.561 |
+| 3-5 | 0.678 | 0.808 |
+| 6-10 | 0.747 | 0.850 |
+| 11-15 | 0.809 | 0.874 |
+| 16+ | 0.844 | 0.913 |
+
+![Figure 25. Candidate stability proxy versus employee retention by experience band.](figures/c01_lifecycle.png){width=90%}
+
+**Reading it:** both rates rise with experience. The **0-2 year band is the weakest on both measures** (61.6% and 56.1%). From **6 years upward**, the stability proxy is 75% or more and retention is 85% or more.
+
+# Summary of results
+
+**Model metrics (saved to `model_metrics.csv`):**
+
+| Model | Threshold | Accuracy | Recall | Specificity | Precision | AUC |
+| --- | --- | --- | --- | --- | --- | --- |
+| Candidate proxy | 0.50 | 0.767 | 0.932 | 0.271 | 0.794 | 0.770 |
+| Candidate proxy (tuned) | 0.76 | 0.726 | 0.721 | 0.744 | 0.894 | 0.770 |
+| Retention | 0.50 | 0.850 | 0.203 | 0.974 | 0.600 | 0.768 |
+| Retention (tuned) | 0.26 | 0.837 | 0.559 | 0.890 | 0.493 | 0.768 |
+
+**Final printed summary:**
+
+```
+================ SUMMARY ================
+Candidates analysed           : 19158
+Not-seeking-change proxy rate : 75.1%
+Candidate proxy model AUC     : 0.77
+Employees analysed            : 1470
+Overall attrition rate        : 16.1%
+Attrition model AUC           : 0.768
+Files written: top_candidates_shortlist.csv, candidate_join_rules.csv,
+               candidate_notjoin_rules.csv, attrition_association_rules.csv, model_metrics.csv
+=========================================
+```
+
+# Key findings and conclusion
+
+1. **Candidate stability rises with experience** (61.6% to 84.4%) and is higher with relevant experience (78.5% against 66.2%) and without full-time study (78.9% against 61.9%).
+2. **City development is the strongest candidate factor**, followed by known employer details. Graduates in mid- or low-development cities without relevant experience, and early-career candidates, are most often seeking a change.
+3. **The shortlist ranking works**: the actual rate falls from 91.4% in the top tiers to 44.9% in the bottom tier, and predicted rates are close to actual ones.
+4. **Attrition concentrates in identifiable groups**: overtime (30.5% against 10.4%), the first two years (43.9%), sales representatives (39.8%), lower income and low satisfaction. Overtime multiplies the odds of leaving by about 4.5 in the model.
+5. **Tuning the cut-off matters**: it raised attrition recall from 20.3% to 55.9%, and it balanced the candidate model (recall 72.1%, specificity 74.4%).
+6. **Early-career staff are the weak point at both ends**: the lowest candidate stability and the lowest employee retention are both in the 0-2 year band.
+
+**Conclusion.** One workflow of preprocessing, logistic regression, LIME and association rules can rank candidate profiles and flag employees at risk, with a reason attached to each prediction.
+
+# Limitations
+
+- The candidate outcome is **job-change intent**, a proxy for joining, not a recorded offer acceptance. The shortlist rewards stable profiles, not necessarily the best hires.
+- The candidate data has **no job-role column**, so role-level insight comes only from the employee data.
+- The IBM data is **simulated**, and the two datasets describe **different people**, so Part C is an indicator, not proof.
+- Both outcomes are **imbalanced**. The employee test set is small (367 employees, 59 leavers).
+- Logistic regression shows **association, not cause**. LIME explanations are local and approximate (the high-scorer explanations in Figure 12 have a low fit), and rules depend on how fields were banded.
+- Blank values are kept as an **"Unknown"** category, so rules containing it describe missing data and not a real group.
+
+# Glossary
+
+| Term | Meaning |
+| --- | --- |
+| Proxy | A stand-in measure. Here, "not seeking a job change" stands in for stability |
+| Odds ratio | How much a one-step change in a feature multiplies the odds of the outcome |
+| Threshold (cut-off) | The probability above which we predict "Yes" |
+| Recall (sensitivity) | Of the real Yes cases, the share found |
+| Specificity | Of the real No cases, the share correctly left out |
+| Precision | Of the predicted Yes cases, the share that are right |
+| AUC | Overall ranking quality, from 0.5 (random) to 1 (perfect) |
+| Youden's J | Rule for picking the cut-off that best balances recall and specificity |
+| Cross-validation | Training and checking on several slices of the training data to test stability |
+| LIME | Explains one prediction by fitting a simple model around it |
+| Explanation fit | How well LIME's local model matches the real model for that case |
+| Support, confidence, lift | Share of records matching a rule, share of those with the outcome, and how many times more common the outcome is than average |
+
+# How to reproduce
+
+1. Open the notebook in Google Colab and choose **Runtime > Change runtime type > R**.
+2. Upload `aug_train.csv` (Kaggle: HR Analytics: Job Change of Data Scientists) to the Files panel. If it is missing, the notebook loads the same data from the `dlookr` package, which is slower.
+3. Run the cells from top to bottom. The employee data downloads automatically from GitHub, or upload a local copy named `WA_Fn-UseC_-HR-Employee-Attrition.csv`.
+4. To knit this document, keep the `figures` folder next to the `.Rmd` file and use **Knit** in RStudio, or `rmarkdown::render("Talent_Lifecycle_Project_Explained.Rmd")`.
